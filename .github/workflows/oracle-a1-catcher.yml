@@ -9,6 +9,7 @@ on:
 permissions:
   contents: read
   actions: write
+  issues: write
 
 concurrency:
   group: oracle-a1-catcher
@@ -61,11 +62,159 @@ jobs:
           oci iam availability-domain list > /dev/null
           echo "Autenticação OCI funcionando."
 
+      # ============================================================
+      # ESTADO PERSISTENTE DA CAÇA
+      # ============================================================
+
+      - name: Registrar tentativa
+        id: hunt_state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          STATE_TITLE="[A1-CATCHER] Estado interno"
+          API="/repos/${GITHUB_REPOSITORY}/issues"
+
+          echo "Procurando estado anterior..."
+
+          ISSUE_NUMBER=$(
+            gh api "${API}?state=all&per_page=100" \
+              --jq ".[] | select(.title == \"${STATE_TITLE}\") | .number" \
+              | head -n 1
+          )
+
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          if [ -z "$ISSUE_NUMBER" ]; then
+
+            echo "Nenhum estado anterior encontrado."
+            echo "Iniciando nova caça."
+
+            STARTED_AT="$NOW"
+            ATTEMPT=1
+
+            BODY=$(
+              jq -n \
+                --arg started_at "$STARTED_AT" \
+                --arg updated_at "$NOW" \
+                --arg run_id "$GITHUB_RUN_ID" \
+                --argjson attempt "$ATTEMPT" \
+                '{
+                  started_at: $started_at,
+                  attempt: $attempt,
+                  last_updated_at: $updated_at,
+                  last_run_id: $run_id
+                }'
+            )
+
+            CREATED=$(
+              gh api \
+                --method POST \
+                "$API" \
+                -f title="$STATE_TITLE" \
+                -f body="$BODY"
+            )
+
+            ISSUE_NUMBER=$(
+              printf '%s' "$CREATED" |
+                jq -r '.number'
+            )
+
+          else
+
+            echo "Estado encontrado no Issue #$ISSUE_NUMBER"
+
+            BODY=$(
+              gh api \
+                "$API/$ISSUE_NUMBER" \
+                --jq '.body'
+            )
+
+            STARTED_AT=$(
+              printf '%s' "$BODY" |
+                jq -r '.started_at // empty'
+            )
+
+            PREVIOUS_ATTEMPT=$(
+              printf '%s' "$BODY" |
+                jq -r '.attempt // 0'
+            )
+
+            if [ -z "$STARTED_AT" ] || [ "$STARTED_AT" = "null" ]; then
+              STARTED_AT="$NOW"
+            fi
+
+            if ! [[ "$PREVIOUS_ATTEMPT" =~ ^[0-9]+$ ]]; then
+              PREVIOUS_ATTEMPT=0
+            fi
+
+            ATTEMPT=$((PREVIOUS_ATTEMPT + 1))
+
+            BODY=$(
+              jq -n \
+                --arg started_at "$STARTED_AT" \
+                --arg updated_at "$NOW" \
+                --arg run_id "$GITHUB_RUN_ID" \
+                --argjson attempt "$ATTEMPT" \
+                '{
+                  started_at: $started_at,
+                  attempt: $attempt,
+                  last_updated_at: $updated_at,
+                  last_run_id: $run_id
+                }'
+            )
+
+            gh api \
+              --method PATCH \
+              "$API/$ISSUE_NUMBER" \
+              -f body="$BODY" \
+              > /dev/null
+
+          fi
+
+          START_EPOCH=$(date -d "$STARTED_AT" +%s)
+          NOW_EPOCH=$(date -u +%s)
+
+          ELAPSED=$((NOW_EPOCH - START_EPOCH))
+
+          DAYS=$((ELAPSED / 86400))
+          HOURS=$(((ELAPSED % 86400) / 3600))
+          MINUTES=$(((ELAPSED % 3600) / 60))
+
+          if [ "$DAYS" -gt 0 ]; then
+            ELAPSED_TEXT="${DAYS}d ${HOURS}h ${MINUTES}min"
+          elif [ "$HOURS" -gt 0 ]; then
+            ELAPSED_TEXT="${HOURS}h ${MINUTES}min"
+          else
+            ELAPSED_TEXT="${MINUTES}min"
+          fi
+
+          echo ""
+          echo "======================================"
+          echo "Estado da caça"
+          echo "======================================"
+          echo "Tentativa: #$ATTEMPT"
+          echo "Início: $STARTED_AT"
+          echo "Tempo caçando: $ELAPSED_TEXT"
+          echo "Issue de estado: #$ISSUE_NUMBER"
+          echo "======================================"
+
+          echo "attempt=$ATTEMPT" >> "$GITHUB_OUTPUT"
+          echo "started_at=$STARTED_AT" >> "$GITHUB_OUTPUT"
+          echo "elapsed=$ELAPSED_TEXT" >> "$GITHUB_OUTPUT"
+          echo "issue_number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # ORACLE A1 CATCHER
+      # ============================================================
+
       - name: Procurar e criar A1
         id: catcher
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
 
           echo "result=unknown" >> "$GITHUB_OUTPUT"
 
@@ -122,6 +271,14 @@ jobs:
               --query 'data[0].id' \
               --raw-output
           )
+
+          if [ -z "$IMAGE_ID" ] || \
+             [ "$IMAGE_ID" = "null" ] || \
+             [ "$IMAGE_ID" = "None" ]; then
+
+            echo "Não foi possível encontrar uma imagem Ubuntu 22.04 ARM."
+            exit 1
+          fi
 
           echo "Imagem encontrada: $IMAGE_ID"
 
@@ -222,6 +379,10 @@ jobs:
 
           echo "result=no_capacity" >> "$GITHUB_OUTPUT"
 
+      # ============================================================
+      # DISCORD
+      # ============================================================
+
       - name: Notificar Discord
         if: always()
         shell: bash
@@ -230,26 +391,61 @@ jobs:
           AD: ${{ steps.catcher.outputs.ad }}
           INSTANCE_ID: ${{ steps.catcher.outputs.instance_id }}
           CATCHER_OUTCOME: ${{ steps.catcher.outcome }}
+
+          ATTEMPT: ${{ steps.hunt_state.outputs.attempt }}
+          STARTED_AT: ${{ steps.hunt_state.outputs.started_at }}
         run: |
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          #
+          # Recalcula o tempo no momento da notificação
+          #
+          if [ -n "${STARTED_AT:-}" ]; then
+
+            START_EPOCH=$(date -d "$STARTED_AT" +%s)
+            NOW_EPOCH=$(date -u +%s)
+
+            ELAPSED=$((NOW_EPOCH - START_EPOCH))
+
+            DAYS=$((ELAPSED / 86400))
+            HOURS=$(((ELAPSED % 86400) / 3600))
+            MINUTES=$(((ELAPSED % 3600) / 60))
+
+            if [ "$DAYS" -gt 0 ]; then
+              HUNT_TIME="${DAYS}d ${HOURS}h ${MINUTES}min"
+            elif [ "$HOURS" -gt 0 ]; then
+              HUNT_TIME="${HOURS}h ${MINUTES}min"
+            else
+              HUNT_TIME="${MINUTES}min"
+            fi
+
+          else
+            HUNT_TIME="N/A"
+          fi
 
           if [ "$CATCHER_OUTCOME" = "failure" ]; then
 
             MESSAGE="🔴 **Oracle A1 Catcher - ERRO**
 
+          🔎 **Tentativa:** #${ATTEMPT:-N/A}
+          ⏱️ **Tempo caçando:** ${HUNT_TIME}
+
           O workflow encontrou um erro durante a execução.
 
-          Resultado: \`${RESULT:-unknown}\`
-          AD: \`${AD:-N/A}\`
+          **Resultado:** \`${RESULT:-unknown}\`
+          **AD:** \`${AD:-N/A}\`
 
-          🔗 Logs:
+          🔗 **Logs:**
           $RUN_URL"
 
           elif [ "$RESULT" = "created" ]; then
 
             MESSAGE="🟢 **ORACLE A1 CRIADA!**
 
-          🚀 Conseguimos pegar a VPS!
+          🚀 **CONSEGUIMOS PEGAR A VPS!**
+
+          🎯 **Tentativa:** #${ATTEMPT:-N/A}
+          ⏱️ **Tempo total caçando:** ${HUNT_TIME}
 
           **Shape:** VM.Standard.A1.Flex
           **CPU:** 2 OCPU
@@ -260,44 +456,53 @@ jobs:
           **Instance OCID:**
           \`$INSTANCE_ID\`
 
-          🔗 Execução:
+          🔗 **Execução:**
           $RUN_URL"
 
           elif [ "$RESULT" = "exists" ]; then
 
             MESSAGE="🔵 **Oracle A1 Catcher**
 
+          🔎 **Tentativa:** #${ATTEMPT:-N/A}
+          ⏱️ **Tempo caçando:** ${HUNT_TIME}
+
           A VPS \`oracle-a1-free\` já existe.
 
           Nenhuma nova instância foi criada.
 
-          🔗 Execução:
+          🔗 **Execução:**
           $RUN_URL"
 
           elif [ "$RESULT" = "no_capacity" ]; then
 
             MESSAGE="🟡 **Oracle A1 Catcher**
 
+          🔎 **Tentativa:** #${ATTEMPT:-N/A}
+          ⏱️ **Tempo caçando:** ${HUNT_TIME}
+
           Verificação concluída.
 
-          PHX-AD-1: sem capacidade
-          PHX-AD-2: sem capacidade
-          PHX-AD-3: sem capacidade
+          ❌ PHX-AD-1: sem capacidade
+          ❌ PHX-AD-2: sem capacidade
+          ❌ PHX-AD-3: sem capacidade
 
-          Próxima tentativa automática em aproximadamente 5 minutos.
+          ⏳ Próxima tentativa automática em aproximadamente 5 minutos.
 
-          🔗 Execução:
+          🔗 **Execução:**
           $RUN_URL"
 
           else
 
             MESSAGE="🔴 **Oracle A1 Catcher**
 
+          🔎 **Tentativa:** #${ATTEMPT:-N/A}
+          ⏱️ **Tempo caçando:** ${HUNT_TIME}
+
           A execução terminou em um estado inesperado.
 
-          Resultado: \`${RESULT:-unknown}\`
+          **Resultado:** \`${RESULT:-unknown}\`
 
-          🔗 Logs:
+          🔗 **Logs:**
           $RUN_URL"
 
           fi
@@ -312,9 +517,17 @@ jobs:
             --fail \
             --silent \
             --show-error \
+            --connect-timeout 10 \
+            --max-time 30 \
+            --retry 3 \
+            --retry-delay 2 \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" \
             "$DISCORD_WEBHOOK_URL" || true
+
+      # ============================================================
+      # PARA DE CAÇAR DEPOIS QUE CONSEGUIR
+      # ============================================================
 
       - name: Desativar catcher após criar a VPS
         if: steps.catcher.outputs.result == 'created'
