@@ -1,0 +1,195 @@
+name: Oracle A1 Catcher
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: oracle-a1-catcher
+  cancel-in-progress: false
+
+jobs:
+  catcher:
+    runs-on: ubuntu-latest
+
+    env:
+      OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+      OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_REGION: ${{ secrets.OCI_REGION }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+
+    steps:
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar OCI CLI
+        run: |
+          pip install --quiet oci-cli
+          oci --version
+
+      - name: Configurar credenciais OCI
+        shell: bash
+        run: |
+          mkdir -p ~/.oci
+
+          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=$OCI_USER_OCID
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY_OCID
+          region=$OCI_REGION
+          key_file=$HOME/.oci/oci_api_key.pem
+          EOF
+
+          chmod 600 ~/.oci/config
+
+      - name: Testar autenticação
+        run: |
+          oci iam availability-domain list > /dev/null
+          echo "Autenticação OCI funcionando."
+
+      - name: Procurar e criar A1
+        shell: bash
+        run: |
+          set -u
+
+          INSTANCE_NAME="oracle-a1-free"
+
+          SUBNET_ID="ocid1.subnet.oc1.phx.aaaaaaaabc3mznwwnefjuszs7dbjc4bduoxr2ycrhhphtc3ax4h33puuhw6q"
+
+          ADS=(
+            "hEWV:PHX-AD-1"
+            "hEWV:PHX-AD-2"
+            "hEWV:PHX-AD-3"
+          )
+
+          SSH_PUBLIC_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDjccrD7P62MVJQm1zDVFRmyhsHbwGiy2vrxYOjx9XFe oracle-a1"
+
+          echo "Verificando se a VPS já existe..."
+
+          EXISTING=$(
+            oci compute instance list \
+              --compartment-id "$OCI_TENANCY_OCID" \
+              --display-name "$INSTANCE_NAME" \
+              --all \
+              --output json |
+            python -c '
+          import json, sys
+          data = json.load(sys.stdin)["data"]
+          print(sum(1 for i in data if i["lifecycle-state"] != "TERMINATED"))
+          '
+          )
+
+          if [ "$EXISTING" -gt 0 ]; then
+            echo "A VPS $INSTANCE_NAME já existe."
+            echo "Nenhuma nova instância será criada."
+            exit 0
+          fi
+
+          echo "Buscando Ubuntu 22.04 ARM mais recente..."
+
+          IMAGE_ID=$(
+            oci compute image list \
+              --compartment-id "$OCI_TENANCY_OCID" \
+              --operating-system "Canonical Ubuntu" \
+              --operating-system-version "22.04" \
+              --shape "VM.Standard.A1.Flex" \
+              --sort-by TIMECREATED \
+              --sort-order DESC \
+              --limit 1 \
+              --query 'data[0].id' \
+              --raw-output
+          )
+
+          echo "Imagem encontrada: $IMAGE_ID"
+
+          cat > /tmp/capacity.json <<'EOF'
+          [
+            {
+              "instanceShape": "VM.Standard.A1.Flex",
+              "instanceShapeConfig": {
+                "ocpus": 2,
+                "memoryInGBs": 12
+              }
+            }
+          ]
+          EOF
+
+          printf '%s\n' "$SSH_PUBLIC_KEY" > /tmp/oracle-a1.pub
+
+          for AD in "${ADS[@]}"; do
+
+            echo ""
+            echo "======================================"
+            echo "Verificando $AD"
+            echo "======================================"
+
+            STATUS=$(
+              oci compute compute-capacity-report create \
+                --availability-domain "$AD" \
+                --compartment-id "$OCI_TENANCY_OCID" \
+                --shape-availabilities file:///tmp/capacity.json \
+                --query 'data."shape-availabilities"[0]."availability-status"' \
+                --raw-output
+            )
+
+            echo "Status: $STATUS"
+
+            if [ "$STATUS" != "AVAILABLE" ]; then
+              continue
+            fi
+
+            echo ""
+            echo "CAPACIDADE ENCONTRADA EM $AD"
+            echo "Tentando criar a VPS..."
+
+            set +e
+
+            LAUNCH_OUTPUT=$(
+              oci compute instance launch \
+                --availability-domain "$AD" \
+                --compartment-id "$OCI_TENANCY_OCID" \
+                --shape "VM.Standard.A1.Flex" \
+                --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+                --image-id "$IMAGE_ID" \
+                --subnet-id "$SUBNET_ID" \
+                --assign-public-ip true \
+                --boot-volume-size-in-gbs 50 \
+                --ssh-authorized-keys-file /tmp/oracle-a1.pub \
+                --display-name "$INSTANCE_NAME" \
+                --output json 2>&1
+            )
+
+            EXIT_CODE=$?
+
+            set -e
+
+            if [ "$EXIT_CODE" -eq 0 ]; then
+              echo ""
+              echo "======================================"
+              echo "VPS CRIADA COM SUCESSO!"
+              echo "======================================"
+
+              echo "$LAUNCH_OUTPUT" |
+                python -c '
+          import json, sys
+          data = json.load(sys.stdin)["data"]
+          print("OCID:", data["id"])
+          print("Estado:", data["lifecycle-state"])
+          print("AD:", data["availability-domain"])
+          '
+
+              exit 0
+            fi
+
+            echo "A capacidade sumiu antes da criação ou ocorreu outro erro:"
+            echo "$LAUNCH_OUTPUT"
+          done
+
+          echo ""
+          echo "Nenhuma capacidade encontrada agora."
