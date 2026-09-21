@@ -3,6 +3,13 @@ name: Oracle A1 Catcher
 on:
   workflow_dispatch:
 
+  schedule:
+    - cron: "2-59/5 * * * *"
+
+permissions:
+  contents: read
+  actions: write
+
 concurrency:
   group: oracle-a1-catcher
   cancel-in-progress: false
@@ -17,6 +24,7 @@ jobs:
       OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
       OCI_REGION: ${{ secrets.OCI_REGION }}
       OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
     steps:
       - name: Configurar Python
@@ -54,9 +62,12 @@ jobs:
           echo "Autenticação OCI funcionando."
 
       - name: Procurar e criar A1
+        id: catcher
         shell: bash
         run: |
-          set -u
+          set -uo pipefail
+
+          echo "result=unknown" >> "$GITHUB_OUTPUT"
 
           INSTANCE_NAME="oracle-a1-free"
 
@@ -92,8 +103,8 @@ jobs:
           echo "Instâncias existentes com nome $INSTANCE_NAME: $EXISTING"
 
           if [ "$EXISTING" -gt 0 ]; then
-            echo "A VPS $INSTANCE_NAME já existe."
-            echo "Nenhuma nova instância será criada."
+            echo "result=exists" >> "$GITHUB_OUTPUT"
+            echo "A VPS já existe."
             exit 0
           fi
 
@@ -176,27 +187,145 @@ jobs:
             set -e
 
             if [ "$EXIT_CODE" -eq 0 ]; then
+
+              INSTANCE_ID=$(
+                printf '%s' "$LAUNCH_OUTPUT" |
+                  jq -r '.data.id'
+              )
+
               echo ""
               echo "======================================"
               echo "VPS CRIADA COM SUCESSO!"
               echo "======================================"
+              echo "OCID: $INSTANCE_ID"
+              echo "AD: $AD"
 
-              echo "$LAUNCH_OUTPUT" |
-                python -c '
-          import json, sys
-          data = json.load(sys.stdin)["data"]
-          print("OCID:", data["id"])
-          print("Estado:", data["lifecycle-state"])
-          print("AD:", data["availability-domain"])
-          '
+              echo "result=created" >> "$GITHUB_OUTPUT"
+              echo "ad=$AD" >> "$GITHUB_OUTPUT"
+              echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
 
               exit 0
             fi
 
             echo ""
-            echo "A capacidade sumiu antes da criação ou ocorreu outro erro:"
+            echo "Falha ao criar a VPS:"
             echo "$LAUNCH_OUTPUT"
+
+            echo "result=launch_error" >> "$GITHUB_OUTPUT"
+            echo "ad=$AD" >> "$GITHUB_OUTPUT"
+
+            exit 1
           done
 
           echo ""
           echo "Nenhuma capacidade encontrada agora."
+
+          echo "result=no_capacity" >> "$GITHUB_OUTPUT"
+
+      - name: Notificar Discord
+        if: always()
+        shell: bash
+        env:
+          RESULT: ${{ steps.catcher.outputs.result }}
+          AD: ${{ steps.catcher.outputs.ad }}
+          INSTANCE_ID: ${{ steps.catcher.outputs.instance_id }}
+          CATCHER_OUTCOME: ${{ steps.catcher.outcome }}
+        run: |
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          if [ "$CATCHER_OUTCOME" = "failure" ]; then
+
+            MESSAGE="🔴 **Oracle A1 Catcher - ERRO**
+
+          O workflow encontrou um erro durante a execução.
+
+          Resultado: \`${RESULT:-unknown}\`
+          AD: \`${AD:-N/A}\`
+
+          🔗 Logs:
+          $RUN_URL"
+
+          elif [ "$RESULT" = "created" ]; then
+
+            MESSAGE="🟢 **ORACLE A1 CRIADA!**
+
+          🚀 Conseguimos pegar a VPS!
+
+          **Shape:** VM.Standard.A1.Flex
+          **CPU:** 2 OCPU
+          **RAM:** 12 GB
+          **Sistema:** Ubuntu 22.04 ARM
+          **AD:** \`$AD\`
+
+          **Instance OCID:**
+          \`$INSTANCE_ID\`
+
+          🔗 Execução:
+          $RUN_URL"
+
+          elif [ "$RESULT" = "exists" ]; then
+
+            MESSAGE="🔵 **Oracle A1 Catcher**
+
+          A VPS \`oracle-a1-free\` já existe.
+
+          Nenhuma nova instância foi criada.
+
+          🔗 Execução:
+          $RUN_URL"
+
+          elif [ "$RESULT" = "no_capacity" ]; then
+
+            MESSAGE="🟡 **Oracle A1 Catcher**
+
+          Verificação concluída.
+
+          PHX-AD-1: sem capacidade
+          PHX-AD-2: sem capacidade
+          PHX-AD-3: sem capacidade
+
+          Próxima tentativa automática em aproximadamente 5 minutos.
+
+          🔗 Execução:
+          $RUN_URL"
+
+          else
+
+            MESSAGE="🔴 **Oracle A1 Catcher**
+
+          A execução terminou em um estado inesperado.
+
+          Resultado: \`${RESULT:-unknown}\`
+
+          🔗 Logs:
+          $RUN_URL"
+
+          fi
+
+          PAYLOAD=$(
+            jq -n \
+              --arg content "$MESSAGE" \
+              '{content: $content}'
+          )
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$DISCORD_WEBHOOK_URL" || true
+
+      - name: Desativar catcher após criar a VPS
+        if: steps.catcher.outputs.result == 'created'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "VPS criada. Desativando futuras execuções do catcher..."
+
+          gh api \
+            --method PUT \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/oracle-a1-catcher.yml/disable"
+
+          echo "Workflow desativado."
