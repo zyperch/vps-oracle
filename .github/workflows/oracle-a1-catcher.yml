@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: Configurar Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -77,12 +77,8 @@ jobs:
               --compartment-id "$OCI_TENANCY_OCID" \
               --display-name "$INSTANCE_NAME" \
               --all \
-              --output json |
-            python -c '
-          import json, sys
-          data = json.load(sys.stdin)["data"]
-          print(sum(1 for i in data if i["lifecycle-state"] != "TERMINATED"))
-          '
+              --query "length(data[?\"lifecycle-state\" != 'TERMINATED'])" \
+              --raw-output
           )
 
           if [ "$EXISTING" -gt 0 ]; then
