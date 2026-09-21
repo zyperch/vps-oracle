@@ -79,7 +79,7 @@ jobs:
               --all \
               --output json
           )
-          
+
           if [ -z "$INSTANCE_JSON" ]; then
             EXISTING=0
           else
@@ -88,10 +88,14 @@ jobs:
                 jq '[.data[]? | select(."lifecycle-state" != "TERMINATED")] | length'
             )
           fi
-          
+
           echo "Instâncias existentes com nome $INSTANCE_NAME: $EXISTING"
-          
+
           if [ "$EXISTING" -gt 0 ]; then
+            echo "A VPS $INSTANCE_NAME já existe."
+            echo "Nenhuma nova instância será criada."
+            exit 0
+          fi
 
           echo "Buscando Ubuntu 22.04 ARM mais recente..."
 
@@ -189,6 +193,7 @@ jobs:
               exit 0
             fi
 
+            echo ""
             echo "A capacidade sumiu antes da criação ou ocorreu outro erro:"
             echo "$LAUNCH_OUTPUT"
           done
