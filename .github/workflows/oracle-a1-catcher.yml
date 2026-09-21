@@ -72,20 +72,26 @@ jobs:
 
           echo "Verificando se a VPS já existe..."
 
-          EXISTING=$(
+          INSTANCE_JSON=$(
             oci compute instance list \
               --compartment-id "$OCI_TENANCY_OCID" \
               --display-name "$INSTANCE_NAME" \
               --all \
-              --query "length(data[?\"lifecycle-state\" != 'TERMINATED'])" \
-              --raw-output
+              --output json
           )
-
-          if [ "$EXISTING" -gt 0 ]; then
-            echo "A VPS $INSTANCE_NAME já existe."
-            echo "Nenhuma nova instância será criada."
-            exit 0
+          
+          if [ -z "$INSTANCE_JSON" ]; then
+            EXISTING=0
+          else
+            EXISTING=$(
+              printf '%s' "$INSTANCE_JSON" |
+                jq '[.data[]? | select(."lifecycle-state" != "TERMINATED")] | length'
+            )
           fi
+          
+          echo "Instâncias existentes com nome $INSTANCE_NAME: $EXISTING"
+          
+          if [ "$EXISTING" -gt 0 ]; then
 
           echo "Buscando Ubuntu 22.04 ARM mais recente..."
 
